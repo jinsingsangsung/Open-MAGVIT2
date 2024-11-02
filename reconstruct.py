@@ -1,5 +1,6 @@
 """
 Image Reconstruction code
+command: python3 reconstruct.py --config_file "configs/gpu/imagenet_lfqgan_256_L.yaml" --ckpt_path  /mnt/tmp/imagenet_256_L.ckpt --save_dir "./visualize" --version  "1k" --image_num 50 --image_size 256
 """
 import os
 import sys
@@ -75,6 +76,12 @@ def main(args):
     configs.data.init_args.test.params.config.subset = args.subset #using the specific data for comparsion
 
     model = load_vqgan_new(configs, args.ckpt_path).to(DEVICE)
+    # Count and print parameters for encoder and decoder
+    encoder_params = sum(p.numel() for p in model.encoder.parameters()) / 1e6
+    decoder_params = sum(p.numel() for p in model.decoder.parameters()) / 1e6
+    print(f"Encoder parameters: {encoder_params:.1f}M")
+    print(f"Decoder parameters: {decoder_params:.1f}M")
+    import pdb; pdb.set_trace()
 
     visualize_dir = args.save_dir
     visualize_version = args.version
@@ -99,44 +106,48 @@ def main(args):
         # Get image dimensions
         _, H, W = image.shape
         
-        # Calculate number of patches
-        n_h = (H + 639) // 640  # Ceiling division
-        n_w = (W + 639) // 640
-        
-        # Initialize tensor to store reconstructed patches
-        reconstructed = torch.zeros_like(image)
-        
-        # Process each patch
-        for i in range(n_h):
-            for j in range(n_w):
-                # Extract patch
-                h_start = i * 640
-                w_start = j * 640
-                h_end = min(h_start + 640, H)
-                w_end = min(w_start + 640, W)
-                
-                # Pad if necessary
-                patch = image[:, h_start:h_end, w_start:w_end]
-                if patch.shape[1:] != (640, 640):
-                    padded = torch.zeros(3, 640, 640, device=patch.device)
-                    padded[:, :patch.shape[1], :patch.shape[2]] = patch
-                    patch = padded
-                
-                # Process patch
-                patch = patch.unsqueeze(0).to(DEVICE)  # Add batch dimension
-                
-                if model.use_ema:
-                    with model.ema_scope():
+        patchify = False
+        if patchify:
+            # Calculate number of patches
+            n_h = (H + 639) // 640  # Ceiling division
+            n_w = (W + 639) // 640
+            
+            # Initialize tensor to store reconstructed patches
+            reconstructed = torch.zeros_like(image)
+            
+            # Process each patch
+            for i in range(n_h):
+                for j in range(n_w):
+                    # Extract patch
+                    h_start = i * 640
+                    w_start = j * 640
+                    h_end = min(h_start + 640, H)
+                    w_end = min(w_start + 640, W)
+                    
+                    # Pad if necessary
+                    patch = image[:, h_start:h_end, w_start:w_end]
+                    if patch.shape[1:] != (640, 640):
+                        padded = torch.zeros(3, 640, 640, device=patch.device)
+                        padded[:, :patch.shape[1], :patch.shape[2]] = patch
+                        patch = padded
+                    
+                    # Process patch
+                    patch = patch.unsqueeze(0).to(DEVICE)  # Add batch dimension
+                    
+                    if model.use_ema:
+                        with model.ema_scope():
+                            reconstructed_patch, _, _ = model(patch)
+                    else:
                         reconstructed_patch, _, _ = model(patch)
-                else:
-                    reconstructed_patch, _, _ = model(patch)
-                
-                # Place reconstructed patch back
-                reconstructed_patch = reconstructed_patch[0]  # Remove batch dimension
-                if h_end - h_start != 640 or w_end - w_start != 640:
-                    reconstructed_patch = reconstructed_patch[:, :h_end-h_start, :w_end-w_start]
-                reconstructed[:, h_start:h_end, w_start:w_end] = reconstructed_patch.cpu()
-        
+                    
+                    # Place reconstructed patch back
+                    reconstructed_patch = reconstructed_patch[0]  # Remove batch dimension
+                    if h_end - h_start != 640 or w_end - w_start != 640:
+                        reconstructed_patch = reconstructed_patch[:, :h_end-h_start, :w_end-w_start]
+                    reconstructed[:, h_start:h_end, w_start:w_end] = reconstructed_patch.cpu()
+        else:
+            reconstructed, _, _ = model(image)
+
         # Save the full reconstructed image
         reconstructed_image = custom_to_pil(reconstructed)
         reconstructed_image.save("reconstructed_magvit.png")
