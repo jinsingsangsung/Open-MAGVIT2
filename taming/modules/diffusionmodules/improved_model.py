@@ -120,7 +120,7 @@ class Encoder(nn.Module):
         x = self.norm_out(x)
         x = swish(x)
         x = self.conv_out(x)
-
+        print("encoder output shape: ", x.shape)
         return x
 
 class Decoder(nn.Module):

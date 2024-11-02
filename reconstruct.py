@@ -11,11 +11,13 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from taming.models.lfqgan import VQModel
+
 import argparse
 try:
 	import torch_npu
 except:
     pass
+import torchvision
 
 if hasattr(torch, "npu"):
     DEVICE = torch.device("npu:0" if torch_npu.npu.is_available() else "cpu")
@@ -53,6 +55,18 @@ def custom_to_pil(x):
 		x = x.convert("RGB")
 	return x
 
+def psnr(original, reconstructed):
+    # Convert from [-1,1] to [0,1] range
+    original = (original + 1) / 2
+    reconstructed = (reconstructed + 1) / 2
+    
+    mse = torch.mean((original - reconstructed) ** 2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 1.0
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+    return psnr.item()
+
 def main(args):
     config_file = args.config_file
     configs = OmegaConf.load(config_file)
@@ -72,30 +86,63 @@ def main(args):
     if not os.path.exists(visualize_rec):
        os.makedirs(visualize_rec, exist_ok=True)
     
-    dataset = instantiate_from_config(configs.data)
-    dataset.prepare_data()
-    dataset.setup()
+    # dataset = instantiate_from_config(configs.data)
+    # dataset.prepare_data()
+    # dataset.setup()
 
     count = 0
     with torch.no_grad():
-        for idx, batch in tqdm(enumerate(dataset._val_dataloader())):
-            if count > args.image_num:
-               break
-            images = batch["image"].permute(0, 3, 1, 2).to(DEVICE)
+        # Load and preprocess the image
+        image = torchvision.io.read_image("/home/nsml/MambaNeRV/data/bunny/0001.png").float()
+        image = (image / 255.0) * 2 - 1  # Normalize to [-1, 1]
+        
+        # Get image dimensions
+        _, H, W = image.shape
+        
+        # Calculate number of patches
+        n_h = (H + 639) // 640  # Ceiling division
+        n_w = (W + 639) // 640
+        
+        # Initialize tensor to store reconstructed patches
+        reconstructed = torch.zeros_like(image)
+        
+        # Process each patch
+        for i in range(n_h):
+            for j in range(n_w):
+                # Extract patch
+                h_start = i * 640
+                w_start = j * 640
+                h_end = min(h_start + 640, H)
+                w_end = min(w_start + 640, W)
+                
+                # Pad if necessary
+                patch = image[:, h_start:h_end, w_start:w_end]
+                if patch.shape[1:] != (640, 640):
+                    padded = torch.zeros(3, 640, 640, device=patch.device)
+                    padded[:, :patch.shape[1], :patch.shape[2]] = patch
+                    patch = padded
+                
+                # Process patch
+                patch = patch.unsqueeze(0).to(DEVICE)  # Add batch dimension
+                
+                if model.use_ema:
+                    with model.ema_scope():
+                        reconstructed_patch, _, _ = model(patch)
+                else:
+                    reconstructed_patch, _, _ = model(patch)
+                
+                # Place reconstructed patch back
+                reconstructed_patch = reconstructed_patch[0]  # Remove batch dimension
+                if h_end - h_start != 640 or w_end - w_start != 640:
+                    reconstructed_patch = reconstructed_patch[:, :h_end-h_start, :w_end-w_start]
+                reconstructed[:, h_start:h_end, w_start:w_end] = reconstructed_patch.cpu()
+        
+        # Save the full reconstructed image
+        reconstructed_image = custom_to_pil(reconstructed)
+        reconstructed_image.save("reconstructed_magvit.png")
 
-            count += images.shape[0]
-            if model.use_ema:
-                with model.ema_scope():
-                    reconstructed_images, _, _ = model(images)
-            
-            image = images[0]
-            reconstructed_image = reconstructed_images[0]
-
-            image = custom_to_pil(image)
-            reconstructed_image = custom_to_pil(reconstructed_image)
-
-            image.save(os.path.join(visualize_original, "{}.png".format(idx)))
-            reconstructed_image.save(os.path.join(visualize_rec, "{}.png".format(idx)))
+        psnr_value = psnr(image, reconstructed)
+        print(f"PSNR: {psnr_value:.2f} dB")
 
     
 def get_args():

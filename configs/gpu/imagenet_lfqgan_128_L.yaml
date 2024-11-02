@@ -63,24 +63,24 @@ model:
 
 
 data:
-  class_path: main.DataModuleFromConfig
+  class_path: # main.DataModuleFromConfig
   init_args:
     batch_size: 8
     num_workers: 16
     train:
-      target: taming.data.imagenet.ImageNetTrain
+      target: # taming.data.imagenet.ImageNetTrain
       params:
         config:
           size: 128
           subset:
     validation:
-      target: taming.data.imagenet.ImageNetValidation
+      target: # taming.data.imagenet.ImageNetValidation
       params:
         config:
           size: 128
           subset:
     test:
-      target: taming.data.imagenet.ImageNetValidation
+      target: # taming.data.imagenet.ImageNetValidation
       params:
         config:
           size: 128
