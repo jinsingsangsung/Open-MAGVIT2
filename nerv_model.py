@@ -18,13 +18,12 @@ from torch.nn.functional import interpolate
 import decord
 decord.bridge.set_bridge('torch')
 import glob
-from mambaconv import MambaConv2d, MambaGlobalConv2d, MambaUpConv2d
 from einops import rearrange
 
 
 # Video dataset
 class VideoDataSet(Dataset):
-    def __init__(self, args):
+    def __init__(self, args, with_embeds=False):
         if os.path.isfile(args.data_path):
             self.video = decord.VideoReader(args.data_path)
         else:
@@ -53,6 +52,12 @@ class VideoDataSet(Dataset):
         first_frame = self.img_transform(self.img_load(0))
         self.h, self.w = first_frame.size(-2), first_frame.size(-1)
         self.final_size = self.h * self.w
+        self.with_embeds = with_embeds
+        if with_embeds:
+            self.embeds = {}
+            for files in os.listdir("/mnt/tmp/embeddings/"):
+                if files.endswith('.pth'):
+                    self.embeds[int(files.split('_')[1].split(".")[0])] = torch.load(f'/mnt/tmp/embeddings/{files}')
 
     def img_load(self, idx):
         if isinstance(self.video, list):
@@ -114,7 +119,10 @@ class VideoDataSet(Dataset):
         else:
             tensor_image = self.img_transform(self.img_load(idx))
             norm_idx = float(idx) / len(self.video)
-        sample = {'img': tensor_image, 'idx': idx, 'norm_idx': norm_idx}
+        if self.with_embeds:
+            sample = {'img': tensor_image, 'idx': idx, 'norm_idx': norm_idx, 'embed': self.embeds[idx]}
+        else:
+            sample = {'img': tensor_image, 'idx': idx, 'norm_idx': norm_idx}
         
         return sample
 
@@ -205,7 +213,15 @@ class HNeRV(nn.Module):
                 decoder_layers.append(cur_blk)
                 ngf = new_ngf
         
-        self.decoder = nn.ModuleList(decoder_layers)
+        self.decoder = nn.ModuleList(decoder_layers[2:])
+        self.pre_decoder = nn.Sequential(
+            nn.Conv2d(18, 64, 2, 2),
+            nn.SiLU(),
+            nn.Conv2d(64, 10, 2, 2),
+            nn.SiLU(),
+            nn.Conv2d(10, 57, 3, 1, 1),
+            nn.SiLU(),
+        )
         self.head_layer = nn.Conv2d(ngf, 3, 3, 1, 1) 
         self.out_bias = args.out_bias
 
@@ -220,11 +236,13 @@ class HNeRV(nn.Module):
         # import pdb; pdb.set_trace; from IPython import embed; embed()     
         embed_list = [img_embed]
         dec_start = time.time()
-        output = self.decoder[0](img_embed)
-        n, c, h, w = output.shape
-        output = output.view(n, -1, self.fc_h, self.fc_w, h, w).permute(0,1,4,2,5,3).reshape(n,-1,self.fc_h * h, self.fc_w * w)
-        embed_list.append(output)
-        for layer in self.decoder[1:]:
+        output = self.pre_decoder(img_embed)
+        # import pdb; pdb.set_trace()
+        # output = self.decoder[0](img_embed)
+        # n, c, h, w = output.shape
+        # output = output.view(n, -1, self.fc_h, self.fc_w, h, w).permute(0,1,4,2,5,3).reshape(n,-1,self.fc_h * h, self.fc_w * w)
+        # embed_list.append(output)
+        for layer in self.decoder[0:]:
             output = layer(output) 
             embed_list.append(output)
         # print([a.shape for a in embed_list])
@@ -513,208 +531,6 @@ class ConvNeXt(nn.Module):
             x = self.stages[i](x)
             out_list.append(x)
         return out_list[-1]
-
-class MambaConvNeXt(nn.Module):
-    r""" ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  -
-          https://arxiv.org/pdf/2201.03545.pdf
-
-    Args:
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
-        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
-        drop_path_rate (float): Stochastic depth rate. Default: 0.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
-    """
-    def __init__(self, stage_blocks=0, strds=[2,2,2,2], dims=[96, 192, 384, 768], 
-            in_chans=3, drop_path_rate=0., layer_scale_init_value=1e-6, multiscale_mamba=True,
-                 ):
-        super().__init__()
-
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
-        self.stages = nn.ModuleList() # 4 feature resolution stages, each consisting of multiple residual blocks
-        self.stage_num = len(dims)
-        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, stage_blocks*self.stage_num)] 
-        cur = 0
-        for i in range(self.stage_num):
-            # Build downsample layers
-            if i > 2:
-                downsample_layer = nn.Sequential(
-                        LayerNorm(dims[i-1], eps=1e-6, data_format="channels_first"),
-                        MambaConv2d(dims[i-1], dims[i], kernel_size=strds[i], stride=strds[i]),
-                )
-            elif i in [1,2]:
-                downsample_layer = nn.Sequential(
-                        LayerNorm(dims[i-1], eps=1e-6, data_format="channels_first"),
-                        nn.Conv2d(dims[i-1], dims[i], kernel_size=strds[i], stride=strds[i]),
-                )                
-            else:
-                downsample_layer = nn.Sequential(
-                    nn.Conv2d(in_chans, dims[0], kernel_size=strds[i], stride=strds[i]),
-                    LayerNorm(dims[0], eps=1e-6, data_format="channels_first")
-                )                
-            self.downsample_layers.append(downsample_layer)
-
-            # Build more blocks
-            stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], 
-                layer_scale_init_value=layer_scale_init_value) for j in range(stage_blocks)]
-            )
-            self.stages.append(stage)
-            cur += stage_blocks
-
-        self.multiscale_mamba = multiscale_mamba
-        if multiscale_mamba:
-            from mambaconv import create_block
-            from mamba_ssm.ops.triton.layernorm import RMSNorm
-            factory_kwargs = {'device': None, 'dtype': None}
-            d_state = 64
-            drop_path = 0.
-            rms_norm = True
-            mamba_channels = 4*64
-            self.mamba_block = create_block(
-                d_model=mamba_channels,
-                d_state=d_state,
-                rms_norm = rms_norm,
-                bimamba_type = "v2",
-                if_devide_out=True,
-                **factory_kwargs,
-            )
-            self.dim_matcher = nn.Conv2d(in_channels=16,out_channels=64,kernel_size=1,stride=1)
-            self.dim_matcher2 = nn.Conv2d(in_channels=4*64,out_channels=16,kernel_size=1,stride=1)
-            self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-            self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
-               mamba_channels, eps=1e-5, **factory_kwargs
-            )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def fused_add_norm(self, hidden_states, residual):
-        if residual is None:
-            residual = hidden_states
-        else:
-            residual = residual + self.drop_path(hidden_states)
-        return self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))   
-
-    def multi_scale_mamba(self, multi_scale_list):
-        segmented_list = []
-        stride = [32,16,4,2,1]
-        b, c, h, w = multi_scale_list[-1].shape
-        for i, feature_map in enumerate(multi_scale_list):
-            # og_shape = feature_map.shape
-            if i == 0:
-                continue
-            else:
-                if i == len(multi_scale_list)-1:
-                    feature_map = self.dim_matcher(feature_map)
-                feature_map = feature_map.unfold(dimension=2, size=stride[i], step=stride[i])
-                feature_map = feature_map.unfold(dimension=3, size=stride[i], step=stride[i]) # b, c, h, w, k, k
-                feature_maps = []
-                for i, dir in enumerate([(),(4),(5),(4,5)]):
-                    dir_input = feature_map.flip(dir)
-                    feature_maps.append(dir_input)
-                feature_map = torch.cat(feature_maps, dim=1)
-                feature_map = rearrange(feature_map, 'b c h w k1 k2 -> (b h w) (k1 k2) c')
-            segmented_list.append(feature_map)
-        multi_scale_maps = torch.cat(segmented_list, dim=1)
-        multi_agg_feature_map = rearrange(self.fused_add_norm(*self.mamba_block(multi_scale_maps))[:, -1, :], "(b h w) c -> b c h w", h=h, w=w)
-        return self.dim_matcher2(multi_agg_feature_map)
-
-    def forward(self, x):
-        out_list = []
-        for i in range(self.stage_num):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-            out_list.append(x)
-        if self.multiscale_mamba:
-            out_list.append(self.multi_scale_mamba(out_list))
-        return out_list[-1]
-
-
-class MambaDecoder(nn.Module):
-    r""" ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  -
-          https://arxiv.org/pdf/2201.03545.pdf
-
-    Args:
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
-        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
-        drop_path_rate (float): Stochastic depth rate. Default: 0.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
-    """
-    def __init__(self, stage_blocks=0, strds=[2,2,2,2], dims=[96, 192, 384, 768], 
-            in_chans=12, drop_path_rate=0., layer_scale_init_value=1e-6,
-                 ):
-        super().__init__()
-
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
-        self.stages = nn.ModuleList() # 4 feature resolution stages, each consisting of multiple residual blocks
-        self.stage_num = len(dims)
-        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, stage_blocks*self.stage_num)] 
-        cur = 0
-        for i in range(self.stage_num):
-            # Build downsample layers
-            if i == 0:
-                downsample_layer = nn.Sequential(
-                        MambaUpConv2d(in_chans, dims[i], kernel_size=strds[i], stride=strds[i], dim_change=True),
-                        LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
-                )                
-            elif i in [1,2]:
-                downsample_layer = nn.Sequential(
-                        LayerNorm(dims[i-1], eps=1e-6, data_format="channels_first"),
-                        MambaUpConv2d(dims[i-1], dims[i], kernel_size=strds[i], stride=strds[i], dim_change=i<3),
-                )
-            else:
-                downsample_layer = nn.Sequential(
-                        LayerNorm(dims[i-1], eps=1e-6, data_format="channels_first"),
-                        UpConv2d(dims[i-1], dims[i], kernel_size=strds[i], stride=strds[i], dim_change=i<3),
-                )        
-            self.downsample_layers.append(downsample_layer)
-
-            # Build more blocks
-            stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], 
-                layer_scale_init_value=layer_scale_init_value) for j in range(stage_blocks)]
-            )
-            self.stages.append(stage)
-            cur += stage_blocks
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-    
-    def initialize_upscale(self, weight: list):
-        for i in range(self.stage_num):
-            self.downsample_layers[i][int(i!=0)].initialize_upscale(weight[i])
-
-    def initialize_maps(self, weight: list):
-        for i in range(self.stage_num):
-            self.downsample_layers[i][int(i!=0)].initialize_maps(weight[i])
-
-    def forward(self, x):
-        out_list = []
-        for i in range(self.stage_num):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-            out_list.append(x)
-        # print([a.shape for a in out_list])
-        return out_list[-1]
-
 
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 

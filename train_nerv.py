@@ -83,7 +83,7 @@ def main():
 
     # evaluation parameters
     parser.add_argument('--eval_only', action='store_true', default=False, help='do evaluation only')
-    parser.add_argument('--eval_freq', type=int, default=30, help='evaluation frequency,  added to suffix!!!!')
+    parser.add_argument('--eval_freq', type=int, default=300, help='evaluation frequency,  added to suffix!!!!')
     parser.add_argument('--quant_model_bit', type=int, default=8, help='bit length for model quantization')
     parser.add_argument('--quant_embed_bit', type=int, default=6, help='bit length for embedding quantization')
     parser.add_argument('--quant_axis', type=int, default=0, help='quantization axis (-1 means per tensor)')
@@ -210,10 +210,11 @@ def train(local_rank, args):
 
     # Building model
     model = HNeRV(args)
-    titok_tokenizer = TiTok.from_pretrained("yucornetto/tokenizer_titok_bl128_vq8k_imagenet")
-    titok_tokenizer.eval()
-    titok_tokenizer.requires_grad_(False)
-    codebook = titok_tokenizer.quantize.embedding.weight
+    magvit_configs = OmegaConf.load("configs/gpu/imagenet_lfqgan_256_L.yaml")
+    magvit_configs.data.init_args.batch_size = 1 # change the batch size
+    magvit_configs.data.init_args.test.params.config.size = 256 #using test to inference
+    magvit_configs.data.init_args.test.params.config.subset = None #using the specific data for comparsion
+    model_magvit = load_vqgan_new(magvit_configs, "/mnt/tmp/imagenet_256_L.ckpt")
 
     ##### get model params and flops #####
     if local_rank in [0, None]:
@@ -236,8 +237,9 @@ def train(local_rank, args):
         model = torch.nn.parallel.DistributedDataParallel(model.to(local_rank), device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     elif torch.cuda.is_available():
         model = model.cuda()
-        codebook = codebook.cuda()
-        titok_tokenizer = titok_tokenizer.cuda()
+        model_magvit = model_magvit.cuda()
+        # codebook = codebook.cuda()
+        # titok_tokenizer = titok_tokenizer.cuda()
     elif args.ngpus_per_node > 1:
         model = torch.nn.DataParallel(model)
 
@@ -296,8 +298,12 @@ def train(local_rank, args):
 
         return
 
-    save_embeddings = True
+    save_embeddings = False
     if save_embeddings:
+        if hasattr(torch, "npu"):
+            device = torch.device("npu:0" if torch_npu.npu.is_available() else "cpu")
+        else:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         embed_dir = "/mnt/tmp/embeddings"
         if not os.path.exists(embed_dir):
             os.makedirs(embed_dir)
@@ -305,18 +311,23 @@ def train(local_rank, args):
             img_data, norm_idx, img_idx = data_to_gpu(sample['img'], device), data_to_gpu(sample['norm_idx'], device), data_to_gpu(sample['idx'], device)
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
             cur_input = norm_idx if 'pe' in args.embed else img_data
+            quant, diff, _, loss_break = model_magvit.encode(cur_input)
+            # Save quantized embeddings
+            embed_path = os.path.join(embed_dir, f'embed_{i}.pth')
+            torch.save(quant.cpu(), embed_path)
             
-            
-
-            
-        
-
-
+            # Free GPU memory
+            del img_data, norm_idx, img_idx, img_gt, inpaint_mask, cur_input, quant, diff, loss_break
+            torch.cuda.empty_cache()
 
     # Training
     start = datetime.now()
 
     psnr_list = []
+    embeddings = []
+    for t in range(len(train_dataloader)):
+        embeddings.append(torch.load(f"/mnt/tmp/embeddings/embed_{t}.pth"))
+
     for epoch in range(args.start_epoch, args.epochs):
         model.train()       
         epoch_start_time = datetime.now()
@@ -330,10 +341,15 @@ def train(local_rank, args):
 
             # forward and backward
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
+
+            embed = embeddings[img_idx][0]
+            embed = data_to_gpu(embed, device)
+            embed = embed.detach().requires_grad_()
+
             cur_input = norm_idx if 'pe' in args.embed else img_data
             cur_epoch = (epoch + float(i) / len(train_dataloader)) / args.epochs
             lr = adjust_lr(optimizer, cur_epoch, args)
-            img_out, _, _ = model(cur_input)
+            img_out, _, _ = model(cur_input, embed)
             final_loss = loss_fn(img_out*inpaint_mask, img_gt*inpaint_mask, args.loss)      
             optimizer.zero_grad()
             final_loss.backward()
@@ -588,6 +604,49 @@ def get_codebook_entry(codebook, indices, use_l2_norm=False):
     if use_l2_norm:
         z_quantized = torch.nn.functional.normalize(z_quantized, dim=-1)
     return z_quantized
+
+def load_vqgan_new(config, ckpt_path=None, is_gumbel=False):
+	model = VQModel(**config.model.init_args)
+	if ckpt_path is not None:
+		sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+		missing, unexpected = model.load_state_dict(sd, strict=False)
+	return model.eval()
+
+def get_obj_from_str(string, reload=False):
+    print(string)
+    module, cls = string.rsplit(".", 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+def instantiate_from_config(config):
+    if not "class_path" in config:
+        raise KeyError("Expected key `class_path` to instantiate.")
+    return get_obj_from_str(config["class_path"])(**config.get("init_args", dict()))
+
+def custom_to_pil(x):
+	x = x.detach().cpu()
+	x = torch.clamp(x, -1., 1.)
+	x = (x + 1.)/2.
+	x = x.permute(1,2,0).numpy()
+	x = (255*x).astype(np.uint8)
+	x = Image.fromarray(x)
+	if not x.mode == "RGB":
+		x = x.convert("RGB")
+	return x
+
+def psnr(original, reconstructed):
+    # Convert from [-1,1] to [0,1] range
+    original = (original + 1) / 2
+    reconstructed = (reconstructed + 1) / 2
+    
+    mse = torch.mean((original - reconstructed) ** 2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 1.0
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+    return psnr.item()
 
 
 if __name__ == '__main__':
